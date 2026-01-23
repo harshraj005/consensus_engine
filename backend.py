@@ -149,18 +149,15 @@ def generate_briefing(raw_data):
     return generate_response("researcher", prompt, context=raw_data)
 
 def determine_protocol(user_query):
-    """
-    The Router: Decides if we need a Chat (Level 1), Research (Level 2), or Full Debate (Level 3).
-    Returns a Dictionary: {"level": int, "mode": str}
-    """
+    # ... previous code ...
     prompt = f"""
     Analyze this user query: "{user_query}"
     
     Determine the complexity. Return ONLY one JSON object:
     
-    {{"level": 1, "mode": "CHAT"}} -> For greetings, simple jokes, small talk.
+    {{"level": 1, "mode": "CHAT"}} -> For greetings, "Who are you?", identity questions, simple jokes.
     {{"level": 2, "mode": "RESEARCH"}} -> For specific facts, news, "Who is X?", "Price of Y".
-    {{"level": 3, "mode": "DEEP_DIVE"}} -> For complex coding, ethical dilemmas, creative writing, system design, analysis.
+    {{"level": 3, "mode": "DEEP_DIVE"}} -> For complex coding, ethical dilemmas, analysis.
     
     Return ONLY the JSON.
     """
