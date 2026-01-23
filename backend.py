@@ -1,6 +1,8 @@
 import requests
 import json
 import re
+import time
+import random
 from duckduckgo_search import DDGS
 
 # --- CONFIGURATION ---
@@ -12,13 +14,13 @@ MPS = {
         "model": "llama3.1:8b",
         "name": "🕵️ MP Llama (Intelligence Officer)",
         "role": "You are the Intelligence Officer. Your job is to read raw search data and compile a dense, factual briefing. Ignore pop culture references if the user asks a serious technical or ethical question.",
-        "temp": 0.2  # Low temp for factual accuracy
+        "temp": 0.2
     },
     "strategist": {
         "model": "deepseek-r1:14b",
         "name": "🧠 MP DeepSeek (The Strategist)",
         "role": "You are the Strategist. You use deep Chain-of-Thought reasoning to solve complex problems. CRITICAL: Think and Answer in ENGLISH ONLY.",
-        "temp": 0.0  # Zero temp for pure logic/math
+        "temp": 0.0
     },
     "analyst": {
         "model": "gemma2:9b",
@@ -30,32 +32,33 @@ MPS = {
         "model": "mistral",
         "name": "🛡️ MP Mistral (The Skeptic)",
         "role": "You are the Devil's Advocate. Look for security risks, edge cases, and safety concerns. Be creative in finding flaws.",
-        "temp": 0.6  # Higher temp for creative risk finding
+        "temp": 0.6
     },
     "speaker": {
         "model": "neural-chat",
         "name": "📢 Mr. Speaker",
-        "role": "You are the Speaker. Synthesize the entire debate into one final, clear, polite answer. If previous agents used technical jargon, simplify it for the user.",
-        "temp": 0.5
+        # RULE: Force code inclusion and simple synthesis
+        "role": "You are the Speaker. Your job is to deliver the FINAL ANSWER to the user. \n"
+                "RULES:\n"
+                "1. If the user asked for CODE/SCRIPT, you MUST copy-paste the Strategist's code into your answer.\n"
+                "2. If the user asked for a FACT (e.g. Price), do NOT output code. Just state the answer.\n"
+                "3. Synthesize the critiques, but do not delete the solution.",
+        "temp": 0.3
     }
 }
 
 # --- CORE UTILITIES ---
 
 def unload_model(model_name):
-    """The Kill Switch: Forces RAM flush to prevent crashes."""
+    """The Kill Switch: Forces RAM flush."""
     try:
         requests.post(OLLAMA_API, json={"model": model_name, "keep_alive": 0})
-    except Exception as e:
-        print(f"[System] Warning: Could not unload {model_name}: {e}")
+    except:
+        pass
 
 def generate_response(agent_key, prompt, context="", stream_handler=None):
-    """
-    Generic function to call any MP with specific Temperature and Context settings.
-    """
     agent = MPS[agent_key]
     
-    # Special instructions for DeepSeek to show thoughts
     if agent_key == "strategist":
         prompt += " (Show your thinking process inside <think> tags)"
 
@@ -69,7 +72,6 @@ def generate_response(agent_key, prompt, context="", stream_handler=None):
     YOUR TASK: {prompt}
     """
     
-    # Configure parameters based on the agent's specialization
     options = {
         "num_ctx": 8192 if agent_key == "strategist" else 4096,
         "temperature": agent.get("temp", 0.7)
@@ -83,7 +85,6 @@ def generate_response(agent_key, prompt, context="", stream_handler=None):
     }
 
     response_text = ""
-    
     try:
         with requests.post(OLLAMA_API, json=payload, stream=True) as r:
             r.raise_for_status()
@@ -96,85 +97,92 @@ def generate_response(agent_key, prompt, context="", stream_handler=None):
                             response_text += chunk
                             if stream_handler:
                                 stream_handler(chunk)
-                    except json.JSONDecodeError:
+                    except:
                         continue
     except Exception as e:
         return f"[Error] Model generation failed: {str(e)}"
     
-    # CRITICAL: Unload model immediately after use to save 16GB RAM
     unload_model(agent['model'])
     return response_text
 
-# --- INTELLIGENCE MODULES ---
+# --- INTELLIGENCE MODULES (THE PATCHED SEARCH) ---
 
 def smart_search(query):
     """
-    Fetches 8 sources. Includes a Fallback Mechanism to prevent 'No results found'.
+    The DuckDuckGo Patch:
+    1. Force 'current' context for prices/news.
+    2. Retry loop with delays to bypass Rate Limits (403/202).
+    3. Fallback to simple query if complex one fails.
     """
-    print(f"[Backend] Smart Search initiated for: {query}")
+    print(f"[Backend] DuckDuckGo Search for: {query}")
     
-    try:
-        # ATTEMPT 1: Ask Llama for a "Smart" Keyword
-        refine_prompt = f"Convert this user query into a simple DuckDuckGo search keyword. Query: '{query}'. Output ONLY the keywords. Do not explain."
-        # We do a quick call. Note: Ensure generate_response is imported or available
-        refined_query = generate_response("researcher", refine_prompt).strip()
-        
-        # Cleanup: Remove quotes or prefixes Llama might add
-        refined_query = refined_query.replace('"', '').replace("Search query:", "").strip()
-        
-        print(f"[Backend] Trying Refined Query: '{refined_query}'")
-        results = DDGS().text(refined_query, max_results=8)
-        
-        # ATTEMPT 2: Fallback (If Llama failed us)
-        if not results:
-            print(f"[Backend] Smart search yielded 0 results. Retrying with RAW query: '{query}'")
-            results = DDGS().text(query, max_results=8)
-            
-        # Final Check
-        if not results:
-            return "System Alert: The search engine returned no data. The internet connection might be unstable or the query is too obscure."
-            
-        # Format the data
-        return "\n".join([f"Source {i+1}: {r['title']} - {r['body']}" for i, r in enumerate(results)])
+    # 1. Context Injection
+    # If the user asks for price/news, we force the engine to look at 2025/2026 data
+    if any(k in query.lower() for k in ["price", "current", "news", "latest", "today", "cost"]):
+        search_query = f"{query} current data 2026"
+    else:
+        search_query = query
 
-    except Exception as e:
-        print(f"[Backend] Critical Error: {e}")
-        return f"Error fetching data: {str(e)}"
+    results = []
+    
+    # 2. The Retry Loop (Attempts to bypass bot detection)
+    # We try 3 times. If it fails, we wait a random amount of seconds.
+    for attempt in range(3):
+        try:
+            # Re-initializing DDGS() every time helps reset the session
+            ddgs = DDGS()
+            # Fetch results
+            results = list(ddgs.text(search_query, max_results=6))
+            
+            if results:
+                break # We got data! Exit loop.
+            else:
+                # If valid but empty, try the Fallback (Simple Query)
+                print(f"[Backend] Attempt {attempt+1} empty. Trying fallback...")
+                simple_query = "".join(e for e in query if e.isalnum() or e.isspace())
+                results = list(ddgs.text(simple_query, max_results=6))
+                if results: break
+                
+        except Exception as e:
+            print(f"[Backend] Search Attempt {attempt+1} failed: {e}")
+            time.sleep(random.uniform(1.5, 3.0)) # Random delay helps look like a human
+    
+    if not results:
+        return "SEARCH ERROR: DuckDuckGo is blocking requests. Please wait 10 seconds and try again."
+
+    # Format for the Researcher
+    return "\n".join([f"Source {i+1}: {r['title']} - {r['body']}" for i, r in enumerate(results)])
 
 def generate_briefing(raw_data):
-    """
-    Uses Llama to compress raw search data into a high-density briefing.
-    """
-    prompt = "You are an Intelligence Officer. Read these search results. Construct a SINGLE comprehensive briefing note that captures key facts, conflicting viewpoints, and technical details. Ignore irrelevant results."
+    prompt = "You are an Intelligence Officer. Read these search results. Construct a SINGLE comprehensive briefing note. Ignore pop culture."
     return generate_response("researcher", prompt, context=raw_data)
 
 def determine_protocol(user_query):
-    # ... previous code ...
-    prompt = f"""
-    Analyze this user query: "{user_query}"
-    
-    Determine the complexity. Return ONLY one JSON object:
-    
-    {{"level": 1, "mode": "CHAT"}} -> For greetings, "Who are you?", identity questions, simple jokes.
-    {{"level": 2, "mode": "RESEARCH"}} -> For specific facts, news, "Who is X?", "Price of Y".
-    {{"level": 3, "mode": "DEEP_DIVE"}} -> For complex coding, ethical dilemmas, analysis.
-    
-    Return ONLY the JSON.
     """
+    Router using Llama for better JSON compliance.
+    """
+    prompt = f"""
+    Analyze the user query: "{user_query}"
     
-    # We use Mistral (Skeptic) for routing as it is fast and follows instructions well
-    response = generate_response("skeptic", prompt)
+    Classify it into one of these levels. Return ONLY the JSON object.
     
-    # Robust JSON parsing (in case the model adds extra text)
+    {{"level": 1, "mode": "CHAT"}} -> Greetings, "Who are you?", "What is your name?", simple jokes.
+    {{"level": 2, "mode": "RESEARCH"}} -> "Price of Bitcoin", "Who is CEO of X?", specific facts, news.
+    {{"level": 3, "mode": "DEEP_DIVE"}} -> Coding tasks, "Write a script", "Analyze this", complex problems.
+    
+    JSON:
+    """
+    response = generate_response("researcher", prompt)
+    
     try:
-        # regex to find the json part
         match = re.search(r'\{.*\}', response, re.DOTALL)
         if match:
-            json_str = match.group(0)
-            return json.loads(json_str)
+            return json.loads(match.group(0))
         else:
-            raise ValueError("No JSON found")
+            # Fallback logic
+            lower_q = user_query.lower()
+            if any(x in lower_q for x in ["who are you", "hi", "hello", "name"]):
+                return {"level": 1, "mode": "CHAT"}
+            return {"level": 3, "mode": "DEEP_DIVE"}
     except:
-        # Default to Level 3 (Safe Mode) if parsing fails
-        print("[Backend] Router failed to parse JSON, defaulting to Deep Dive.")
         return {"level": 3, "mode": "DEEP_DIVE"}
